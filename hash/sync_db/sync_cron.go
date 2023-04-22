@@ -114,7 +114,8 @@ func (s *SyncTool) doSyncToDB(cfg *config.HSSyncConfig) {
 		delete(newsData, global.RedisEmptyFlag)
 		if len(newsData) == 0 {
 			// 此时对应的dynamicKey的hash已经删除，数据库也要删除
-			cfg.CurrentDB().Delete("dynamic_key = ?", dynamicKey)
+			err := cfg.CurrentDB().Delete(&model.HSModel{}, "dynamic_key = ?", dynamicKey).Error
+			log.Println(err)
 			// 如果之前有需要同步dynamic_key的操作，就不需要管他了
 			delete(newsData, dynamicKey)
 			continue

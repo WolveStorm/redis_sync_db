@@ -4,6 +4,7 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
 	"log"
 )
 
@@ -22,7 +23,9 @@ func InitPG() {
 	var err error
 	PgDB, err = gorm.Open(postgres.New(postgres.Config{
 		DSN: "host=localhost user=postgres password=postgres dbname=hash port=5432 sslmode=disable", // DSN data source name
-	}), &gorm.Config{})
+	}), &gorm.Config{
+		Logger: logger.Default.LogMode(logger.Info),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
