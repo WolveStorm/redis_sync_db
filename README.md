@@ -1,7 +1,7 @@
 # redis_sync_db
 redis_sync_pg
 
-一个简单的Redis缓存封装。
+一个简单的Redis缓存中对hash操作的封装。
 
 目的：
   1. 数据主要在redis，pg只是备份，为了更好的性能。
