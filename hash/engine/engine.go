@@ -7,8 +7,6 @@ import (
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 	"log"
-	"os"
-	"os/signal"
 	"redis_sync_db/hash/global"
 	"redis_sync_db/hash/sync_db"
 	"sync"
@@ -23,6 +21,7 @@ type HSEngine struct {
 	dynamicKey    string        // 用于标识hsKey的一条记录，可能是ID等
 	expireTime    time.Duration // 缓存过期时间
 	syncer        Syncer
+	Consistent    bool
 }
 
 // NewHSEngine new engine
@@ -33,18 +32,27 @@ func NewHSEngine(client *redis.Client, prefixKey, dynamicKey string, expireTime 
 		prefixKey:  prefixKey,
 		hsKey:      prefixKey + dynamicKey,
 		expireTime: expireTime,
+		Consistent: consistent,
 	}
 	// 尝试刷新缓存或者重新载入缓存
 	engine.loadOrRefreshExpiration()
 	engine.syncer = &RedisSyncer{}
 	if consistent {
+		ctx, cancelFunc := context.WithCancel(context.Background())
 		kafkaSyncer := &KafkaSyncer{
 			MessageQueue: make(chan string, 10),
+			Ctx:          ctx,
+			Cancel:       cancelFunc,
 		}
 		engine.syncer = kafkaSyncer
 		go kafkaSyncer.producerLoop(sync_db.SyncConfigMap[prefixKey].KafkaSyncClient)
 	}
 	return engine
+}
+
+// 主要是关闭kafka的loop
+func (t *HSEngine) Close() {
+	t.syncer.close()
 }
 
 func (t *HSEngine) loadOrRefreshExpiration() {
@@ -220,26 +228,35 @@ func (t *HSEngine) readCallback() {
 
 type Syncer interface {
 	insertWriteMsgToSyncList(ctx context.Context, prefixKey, dynamicKey string) error
+	close() error
 }
 
 type RedisSyncer struct{}
 
-// add msg to msg queue
-// TODO 解决消息丢失的问题
+// add msg to msg queue，当redis宕机，存在丢消息的问题
 func (t *RedisSyncer) insertWriteMsgToSyncList(ctx context.Context, prefixKey, dynamicKey string) error {
 	cfg := sync_db.SyncConfigMap[prefixKey]
 	return cfg.SyncClient.SAdd(ctx, cfg.SyncKey, dynamicKey).Err()
 }
 
+func (t *RedisSyncer) close() error {
+	return nil
+}
+
 type KafkaSyncer struct {
 	MessageQueue chan string
+	Ctx          context.Context
+	Cancel       context.CancelFunc
 }
 
 func (t *KafkaSyncer) insertWriteMsgToSyncList(ctx context.Context, prefixKey, dynamicKey string) error {
 	t.MessageQueue <- dynamicKey
 	return nil
 }
-
+func (t *KafkaSyncer) close() error {
+	defer t.Cancel()
+	return nil
+}
 func (t *KafkaSyncer) producerLoop(client sarama.Client) {
 	var (
 		wg                     sync.WaitGroup
@@ -268,23 +285,20 @@ func (t *KafkaSyncer) producerLoop(client sarama.Client) {
 			error_num++
 		}
 	}()
-	// Trap SIGINT to trigger a graceful shutdown.
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt)
 ProducerLoop:
 	for {
 		select {
 		case msg := <-t.MessageQueue:
 			message := &sarama.ProducerMessage{Topic: "sync_test", Value: sarama.StringEncoder(msg)} // 4
 			producer.Input() <- message
-		case <-signals:
+		case <-t.Ctx.Done():
 			// Trigger a shutdown of the producer.
 			break ProducerLoop
 		default:
 			time.Sleep(100 * time.Millisecond)
 		}
 	}
-
+	// 等待回调处理完成
 	wg.Wait()
 	time.Sleep(time.Second * 2)
 	log.Printf("Successfully produced: %d; errors: %d\n", success_num, error_num)
