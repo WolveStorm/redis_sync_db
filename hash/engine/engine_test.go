@@ -17,7 +17,7 @@ func Test(t *testing.T) {
 		db.InitPG()
 		db.InitRedis()
 		userId := "100001"
-		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute)
+		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute, false)
 		u.HSet(context.Background(), "name", "phm")
 		m := map[string]interface{}{
 			"name": "phm",
@@ -40,7 +40,7 @@ func Test(t *testing.T) {
 		db.InitPG()
 		db.InitRedis()
 		userId := "100001"
-		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute)
+		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute, false)
 		fromDB, err := u.ReadFromDB()
 		if err != nil {
 			log.Fatal(err)
@@ -52,8 +52,9 @@ func Test(t *testing.T) {
 		db.InitPG()
 		db.InitRedis()
 		userId := "100001"
-		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute)
-		u.insertWriteMsgToSyncList(context.Background())
+		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute, true)
+		u.syncer.insertWriteMsgToSyncList(context.Background(), u.prefixKey, u.dynamicKey)
+		time.Sleep(5 * time.Second)
 	})
 
 	// test hset
@@ -61,7 +62,7 @@ func Test(t *testing.T) {
 		db.InitPG()
 		db.InitRedis()
 		userId := "100001"
-		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute)
+		u := NewHSEngine(db.Client, "hash:data:", userId, time.Minute, false)
 		u.HSet(context.Background(), "name", "phm")
 	})
 

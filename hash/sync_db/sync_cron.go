@@ -8,10 +8,13 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 	"log"
+	"os"
+	"os/signal"
 	"redis_sync_db/hash/config"
 	"redis_sync_db/hash/global"
 	"redis_sync_db/hash/model"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -61,14 +64,46 @@ func (s *SyncLock) refreshLock() error {
 func (s *SyncTool) SyncToDB() {
 	s.WG.Add(len(SyncConfigMap))
 	for _, cfg := range SyncConfigMap {
-		safego.Go(func() {
-			s.doSyncToDB(cfg)
-		})
+		if cfg.Consistent {
+			safego.Go(func() {
+				s.doKafkaSyncerToDB(cfg)
+			})
+		} else {
+			safego.Go(func() {
+				s.doRedisSyncerToDB(cfg)
+			})
+		}
 	}
 	s.WG.Wait()
 }
 
-func (s *SyncTool) doSyncToDB(cfg *config.HSSyncConfig) {
+func (s *SyncTool) doKafkaSyncerToDB(cfg *config.HSSyncConfig) {
+	defer s.WG.Done()
+	if cfg == nil {
+		return
+	}
+	lock := applyLock(cfg.SyncClient, cfg.PrefixKey)
+	if lock == nil {
+		// 无法申请到锁
+		return
+	}
+	// 同步完成归还锁
+	defer lock.returnLock()
+	handler := &EventHandler{
+		Client:    cfg.Client,
+		PrefixKey: cfg.PrefixKey,
+		CurrentDB: cfg.CurrentDB(),
+		lock:      lock,
+	}
+	consumer := NewConsumer("sync_group", []string{"sync_test"}, handler)
+	sign := make(chan os.Signal)
+	signal.Notify(sign, syscall.SIGINT, syscall.SIGTERM)
+	go consumer.consume()
+	<-sign
+	defer consumer.cancel()
+}
+
+func (s *SyncTool) doRedisSyncerToDB(cfg *config.HSSyncConfig) {
 	defer s.WG.Done()
 	if cfg == nil {
 		return
@@ -89,7 +124,7 @@ func (s *SyncTool) doSyncToDB(cfg *config.HSSyncConfig) {
 		if lock.refreshLock() != nil {
 			break
 		}
-		dynamicKey, err := cfg.SyncClient.SPop(context.Background(), cfg.SyncKey).Result()
+		dynamicKey, err := popMsgFromRedis(cfg)
 		if err == redis.Nil {
 			// 同步完成,再循环重试几次，实在没有就退出
 			if sleepCount >= maxSleep {
@@ -154,4 +189,8 @@ func doDBSync(db *gorm.DB, syncMap map[string]*model.HSModel) error {
 		Columns:   []clause.Column{{Name: "dynamic_key"}},
 		DoUpdates: clause.AssignmentColumns([]string{"val"}),
 	}).Create(&syncList).Error
+}
+
+func popMsgFromRedis(cfg *config.HSSyncConfig) (string, error) {
+	return cfg.SyncClient.SPop(context.Background(), cfg.SyncKey).Result()
 }

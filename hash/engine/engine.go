@@ -3,11 +3,15 @@ package engine
 import (
 	"context"
 	"fmt"
+	"github.com/Shopify/sarama"
 	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 	"log"
+	"os"
+	"os/signal"
 	"redis_sync_db/hash/global"
 	"redis_sync_db/hash/sync_db"
+	"sync"
 	"time"
 )
 
@@ -18,10 +22,11 @@ type HSEngine struct {
 	prefixKey     string
 	dynamicKey    string        // 用于标识hsKey的一条记录，可能是ID等
 	expireTime    time.Duration // 缓存过期时间
+	syncer        Syncer
 }
 
 // NewHSEngine new engine
-func NewHSEngine(client *redis.Client, prefixKey, dynamicKey string, expireTime time.Duration) *HSEngine {
+func NewHSEngine(client *redis.Client, prefixKey, dynamicKey string, expireTime time.Duration, consistent bool) *HSEngine {
 	engine := &HSEngine{
 		Client:     client,
 		dynamicKey: dynamicKey,
@@ -31,6 +36,14 @@ func NewHSEngine(client *redis.Client, prefixKey, dynamicKey string, expireTime 
 	}
 	// 尝试刷新缓存或者重新载入缓存
 	engine.loadOrRefreshExpiration()
+	engine.syncer = &RedisSyncer{}
+	if consistent {
+		kafkaSyncer := &KafkaSyncer{
+			MessageQueue: make(chan string, 10),
+		}
+		engine.syncer = kafkaSyncer
+		go kafkaSyncer.producerLoop(sync_db.SyncConfigMap[prefixKey].KafkaSyncClient)
+	}
 	return engine
 }
 
@@ -180,7 +193,7 @@ func (t *HSEngine) HVals(ctx context.Context) *redis.StringSliceCmd {
 func (t *HSEngine) writeCallback(ctx context.Context) {
 	// 一个engine对应一条hash记录，我们需要将对应的记录被修改这个消息设置到消息队列中
 	defer func() {
-		if err := t.insertWriteMsgToSyncList(ctx); err != nil {
+		if err := t.syncer.insertWriteMsgToSyncList(ctx, t.prefixKey, t.dynamicKey); err != nil {
 			fmt.Println(err)
 		}
 	}()
@@ -205,9 +218,74 @@ func (t *HSEngine) readCallback() {
 	t.RefreshExpiration()
 }
 
+type Syncer interface {
+	insertWriteMsgToSyncList(ctx context.Context, prefixKey, dynamicKey string) error
+}
+
+type RedisSyncer struct{}
+
 // add msg to msg queue
 // TODO 解决消息丢失的问题
-func (t *HSEngine) insertWriteMsgToSyncList(ctx context.Context) error {
-	cfg := sync_db.SyncConfigMap[t.prefixKey]
-	return cfg.SyncClient.SAdd(ctx, cfg.SyncKey, t.dynamicKey).Err()
+func (t *RedisSyncer) insertWriteMsgToSyncList(ctx context.Context, prefixKey, dynamicKey string) error {
+	cfg := sync_db.SyncConfigMap[prefixKey]
+	return cfg.SyncClient.SAdd(ctx, cfg.SyncKey, dynamicKey).Err()
+}
+
+type KafkaSyncer struct {
+	MessageQueue chan string
+}
+
+func (t *KafkaSyncer) insertWriteMsgToSyncList(ctx context.Context, prefixKey, dynamicKey string) error {
+	t.MessageQueue <- dynamicKey
+	return nil
+}
+
+func (t *KafkaSyncer) producerLoop(client sarama.Client) {
+	var (
+		wg                     sync.WaitGroup
+		success_num, error_num int
+	)
+	producer, err := sarama.NewAsyncProducerFromClient(client) // 3
+	if err != nil {
+		panic(err)
+	}
+	defer producer.AsyncClose()
+	wg.Add(1)
+	go func() {
+		wg.Done()
+		// config.Producer.Return.Successes = true 后一定要监听这个chan，默认大小256 如果满了就阻塞掉
+		for range producer.Successes() {
+			success_num++
+		}
+	}()
+	wg.Add(1)
+	go func() {
+		wg.Done()
+		// config.Producer.Return.Errors = true 后一定要监听这个chan，默认大小256 如果满了就阻塞掉
+		for crush := range producer.Errors() {
+			// 这里简单处理一下重试
+			producer.Input() <- crush.Msg
+			error_num++
+		}
+	}()
+	// Trap SIGINT to trigger a graceful shutdown.
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, os.Interrupt)
+ProducerLoop:
+	for {
+		select {
+		case msg := <-t.MessageQueue:
+			message := &sarama.ProducerMessage{Topic: "sync_test", Value: sarama.StringEncoder(msg)} // 4
+			producer.Input() <- message
+		case <-signals:
+			// Trigger a shutdown of the producer.
+			break ProducerLoop
+		default:
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	wg.Wait()
+	time.Sleep(time.Second * 2)
+	log.Printf("Successfully produced: %d; errors: %d\n", success_num, error_num)
 }
