@@ -36,7 +36,7 @@ func (e EventHandler) Cleanup(session sarama.ConsumerGroupSession) error {
 
 func (e EventHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	allSync := make(map[string]*model.HSModel)
-	batchExcuteCount := 1 // todo test
+	batchExcuteCount := 100
 	syncCount := 0
 	for msg := range claim.Messages() {
 		if e.lock.refreshLock() != nil {
@@ -68,13 +68,13 @@ func (e EventHandler) ConsumeClaim(session sarama.ConsumerGroupSession, claim sa
 		// 处理消息成功后标记为处理, 然后会自动提交
 		syncCount++
 		session.MarkMessage(msg, "")
-		session.Commit()
 		if syncCount%batchExcuteCount == 0 {
 			if err := doDBSync(e.CurrentDB, allSync); err != nil {
 				log.Fatal(err)
 			}
 			// 重置
 			allSync = map[string]*model.HSModel{}
+			session.Commit()
 		}
 	}
 	if syncCount != 0 && len(allSync) > 0 {
